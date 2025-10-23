@@ -1,8 +1,11 @@
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::io::{self, Write};
 
 use crate::args::{DepsFormat, Output};
 use crate::world::SystemWorld;
+
+use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
 
 /// Writes dependencies in the given format.
 pub fn write_deps(
@@ -12,7 +15,7 @@ pub fn write_deps(
     outputs: Option<&[Output]>,
 ) -> io::Result<()> {
     match format {
-        DepsFormat::Json => write_deps_json(world, dest)?,
+        DepsFormat::Json => write_deps_json(world, dest, outputs)?,
         DepsFormat::Zero => write_deps_zero(world, dest)?,
         DepsFormat::Make => {
             if let Some(outputs) = outputs {
@@ -23,25 +26,72 @@ pub fn write_deps(
     Ok(())
 }
 
-/// Writes dependencies in JSON format.
-fn write_deps_json(world: &mut SystemWorld, dest: &Output) -> io::Result<()> {
-    use serde::ser::{SerializeSeq, Serializer};
+/// JSON serializer for the dependencies.
+///
+/// Note: Serialization consumes the iterator, so this adapter cannot be reused after serialization.
+/// Based on https://stackoverflow.com/a/34400370
+struct InputSerializer<I: Iterator<Item = OsString>>(RefCell<I>);
 
+impl<I: Iterator<Item = OsString>> InputSerializer<I> {
+    fn new(iterator: I) -> Self {
+        Self(RefCell::new(iterator))
+    }
+}
+
+impl<I: Iterator<Item = OsString>> Serialize for InputSerializer<I> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(None)?;
+        // Note that the iterator is consumed here:
+        for dep in self.0.borrow_mut().by_ref() {
+            let s = dep.to_str().ok_or_else(|| {
+                serde::ser::Error::custom(format!("input {dep:?} is not valid utf-8"))
+            })?;
+            seq.serialize_element(s)?;
+        }
+        seq.end()
+    }
+}
+
+/// JSON Serializer for the outputs.
+struct OutputSerializer<'a>(&'a [Output]);
+
+impl Serialize for OutputSerializer<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(None)?;
+        for output in self.0 {
+            match output {
+                Output::Path(path) => {
+                    let s = path.as_os_str().to_str().ok_or_else(|| {
+                        <S::Error as serde::ser::Error>::custom(format!(
+                            "output {path:?} is not valid utf-8"
+                        ))
+                    })?;
+                    seq.serialize_element(s)?;
+                }
+                Output::Stdout => {} // Skip stdout outputs.
+            }
+        }
+        seq.end()
+    }
+}
+
+/// Writes dependencies in JSON format.
+fn write_deps_json(
+    world: &mut SystemWorld,
+    dest: &Output,
+    outputs: Option<&[Output]>,
+) -> io::Result<()> {
     let dest = dest.open()?;
     let mut serializer = serde_json::Serializer::new(dest);
-    let mut seq = serializer.serialize_seq(None)?;
+    let mut map = serializer.serialize_map(Some(2))?;
 
-    for dep in relative_dependencies(world)? {
-        let string = dep.as_os_str().to_str().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{dep:?} is not valid utf-8"),
-            )
-        })?;
-        seq.serialize_element(string)?;
-    }
+    map.serialize_entry("inputs", &InputSerializer::new(relative_dependencies(world)?))?;
+    match outputs {
+        None => map.serialize_entry("outputs", &None::<()>)?,
+        Some(outputs) => map.serialize_entry("outputs", &OutputSerializer(outputs))?,
+    };
 
-    seq.end()?;
+    SerializeMap::end(map)?;
     Ok(())
 }
 
